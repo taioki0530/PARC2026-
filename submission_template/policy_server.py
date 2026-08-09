@@ -97,6 +97,15 @@ class MyPolicy(BasePolicy):
     どの段も設定（下のクラス変数）で強度を変えられ、無効化もできる。API 差異や
     例外が起きても安全なアクションを返し、サーバーを落とさない設計にしている。
 
+      (E) マルチチェックポイント・アンサンブル
+          model_weights/ 直下に複数モデルを並べると、全モデル × TTA ビューで
+          予測して実座標平均する。異なる fine-tune（例: 通常 / 照明強め / テクスチャ
+          強め）を分担させ、単一モデルの穴を埋める。(C) の不確実性はモデル間の
+          ばらつきも拾うので、モデルが割れる局面ほど自動で慎重になる。
+
+    設定は全てクラス変数で、さらに環境変数 MYPOLICY_<名前> で上書きできる
+    （コード改変なしで tune.py が総当たり探索する。例: MYPOLICY_TTA_VIEWS=3）。
+
     ------------------------------------------------------------------
     重みの配置（採点環境は外部通信を遮断するため必ず同梱すること）
     ------------------------------------------------------------------
@@ -108,6 +117,13 @@ class MyPolicy(BasePolicy):
             ├── model.safetensors
             ├── policy_preprocessor.json / .safetensors
             └── policy_postprocessor.json / .safetensors
+
+    # 複数チェックポイントをアンサンブルする場合（任意）:
+        └── model_weights/
+            ├── base/     { config.json, model.safetensors, ... }
+            ├── light/    { config.json, model.safetensors, ... }
+            └── texture/  { config.json, model.safetensors, ... }
+    # もしくは MYPOLICY_MODEL_DIRS="modelA,modelB" のようにカンマ区切りで指定する。
 
     観測・アクション仕様（LeRobot の LIBERO 評価ラッパに整合）:
       - agentview → observation.images.image / eye_in_hand → observation.images.image2
@@ -158,42 +174,136 @@ class MyPolicy(BasePolicy):
         self.instruction = ""
         self._rng = _np.random.default_rng(0)
 
-        model_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), self.MODEL_DIR
-        )
-        if not os.path.isdir(model_dir):
+        # 環境変数で全設定を上書きできるようにする（チューニング用。tune.py が使う）。
+        # 例: MYPOLICY_TTA_VIEWS=3 MYPOLICY_UNCERTAINTY_DAMPING=8 python policy_server.py
+        self._load_overrides_from_env()
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        model_dirs = self._discover_model_dirs(here)
+        if not model_dirs:
             raise FileNotFoundError(
-                f"モデルディレクトリが見つかりません: {model_dir}. "
-                "LeRobot 形式の SmolVLA 重み一式を model_weights/ に配置してください。"
+                f"モデルが見つかりません: {os.path.join(here, self.MODEL_DIR)}. "
+                "LeRobot 形式の SmolVLA 重み一式を model_weights/ に配置してください"
+                "（複数チェックポイントをアンサンブルする場合は "
+                "model_weights/<name>/ 以下に各モデルを置くか、"
+                "MYPOLICY_MODEL_DIRS にカンマ区切りで指定する）。"
             )
 
+        # 各モデルを「エンジン」（policy + 前後処理 + chunk API 有無）として保持。
+        self.engines: list[dict] = []
+        for md in model_dirs:
+            self.engines.append(self._load_engine(md))
+        print(f"[MyPolicy] {len(self.engines)} モデルをロード: {model_dirs}")
+
+        self.reset("")
+
+    # ------------------------------------------------------------------
+    # 設定の環境変数オーバーライド / モデル探索・ロード
+    # ------------------------------------------------------------------
+    def _load_overrides_from_env(self) -> None:
+        import os
+
+        # クラス変数のうち、スカラー設定を MYPOLICY_<NAME> で上書きする。
+        overridable = {
+            "FLIP_IMAGES": bool,
+            "TEMPORAL_ENSEMBLE": bool,
+            "REPLAN_INTERVAL": int,
+            "ENSEMBLE_DECAY": float,
+            "TTA_VIEWS": int,
+            "TTA_BRIGHTNESS": float,
+            "TTA_CONTRAST": float,
+            "TTA_GAMMA": float,
+            "UNCERTAINTY_DAMPING": float,
+            "SPEED_SCALE": float,
+            "MAX_POS_DELTA": float,
+            "ACTION_EMA": float,
+            "GRIPPER_MARGIN": float,
+        }
+        for name, caster in overridable.items():
+            raw = os.environ.get(f"MYPOLICY_{name}")
+            if raw is None:
+                continue
+            try:
+                if caster is bool:
+                    val = raw.strip().lower() in ("1", "true", "yes", "on")
+                else:
+                    val = caster(raw)
+                setattr(self, name, val)  # インスタンス属性でクラス変数を隠す
+                print(f"[MyPolicy] override {name}={val}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[MyPolicy] override {name} 無効値 '{raw}' を無視: {exc}")
+
+    def _discover_model_dirs(self, here: str) -> list[str]:
+        import os
+
+        # 明示指定（カンマ区切り、絶対 or here 相対）を最優先。
+        env_dirs = os.environ.get("MYPOLICY_MODEL_DIRS")
+        if env_dirs:
+            dirs = []
+            for d in env_dirs.split(","):
+                d = d.strip()
+                if not d:
+                    continue
+                dirs.append(d if os.path.isabs(d) else os.path.join(here, d))
+            return [d for d in dirs if self._is_model_dir(d)]
+
+        root = os.path.join(here, self.MODEL_DIR)
+        if not os.path.isdir(root):
+            return []
+        # root 自体がモデル一式なら単一モデル。
+        if self._is_model_dir(root):
+            return [root]
+        # そうでなければ、直下のサブディレクトリのうちモデル一式のものを全て使う
+        #（マルチチェックポイント・アンサンブル）。
+        subs = sorted(
+            os.path.join(root, name)
+            for name in os.listdir(root)
+            if os.path.isdir(os.path.join(root, name))
+        )
+        return [d for d in subs if self._is_model_dir(d)]
+
+    @staticmethod
+    def _is_model_dir(path: str) -> bool:
+        import os
+
+        return os.path.isfile(os.path.join(path, "config.json")) and (
+            os.path.isfile(os.path.join(path, "model.safetensors"))
+            or os.path.isfile(os.path.join(path, "model.pt"))
+            or any(
+                n.endswith(".safetensors") for n in os.listdir(path)
+            )
+        )
+
+    def _load_engine(self, model_dir: str) -> dict:
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
-        # ローカルパスからロード（採点環境は外部通信を遮断するため）
-        self.policy = SmolVLAPolicy.from_pretrained(model_dir)
-        self.policy.to(self.device)
-        self.policy.eval()
+        policy = SmolVLAPolicy.from_pretrained(model_dir)  # ローカルパス（外部通信なし）
+        policy.to(self.device)
+        policy.eval()
 
-        # 正規化・言語トークナイズはモデル外部の前後処理パイプラインが担う。
-        self.preprocessor = None
-        self.postprocessor = None
+        pre = post = None
         try:
             from lerobot.processor import make_pre_post_processors
 
-            self.preprocessor, self.postprocessor = make_pre_post_processors(
-                self.policy.config,
-                pretrained_path=model_dir,
+            pre, post = make_pre_post_processors(
+                policy.config, pretrained_path=model_dir
             )
         except Exception as exc:  # noqa: BLE001 - 版差異はフォールバックへ
             print(
-                "[MyPolicy] 前後処理パイプラインをロードできませんでした "
-                f"({exc}). 素通し経路にフォールバックします。"
+                f"[MyPolicy] {model_dir}: 前後処理パイプライン未ロード ({exc}). "
+                "素通し経路にフォールバックします。"
             )
+        return {
+            "policy": policy,
+            "pre": pre,
+            "post": post,
+            "has_chunk": hasattr(policy, "predict_action_chunk"),
+        }
 
-        # full-chunk 予測が使えるか（時間方向アンサンブルの前提）
-        self._has_chunk_api = hasattr(self.policy, "predict_action_chunk")
-
-        self.reset("")
+    @property
+    def _has_chunk_api(self) -> bool:
+        # 全エンジンが full-chunk 予測に対応しているときのみ時間方向アンサンブルを使う。
+        return all(e["has_chunk"] for e in self.engines)
 
     # ------------------------------------------------------------------
     # エピソード制御
@@ -205,11 +315,13 @@ class MyPolicy(BasePolicy):
         self._chunks: list[tuple[int, "np.ndarray", float]] = []
         self._prev_action = None       # EMA 用
         self._gripper_state = 0.0      # ヒステリシス用
-        if hasattr(self.policy, "reset"):
-            try:
-                self.policy.reset()
-            except Exception:  # noqa: BLE001
-                pass
+        for eng in getattr(self, "engines", []):
+            pol = eng["policy"]
+            if hasattr(pol, "reset"):
+                try:
+                    pol.reset()
+                except Exception:  # noqa: BLE001
+                    pass
 
     # ------------------------------------------------------------------
     # 観測 → モデル入力
@@ -274,50 +386,54 @@ class MyPolicy(BasePolicy):
     # ------------------------------------------------------------------
     # モデル推論（1 ビュー分のチャンクを実座標で返す）
     # ------------------------------------------------------------------
-    def _predict_chunk_one(self, obs, image_variant: int) -> "np.ndarray":
+    def _predict_chunk_one(self, obs, image_variant: int, engine: dict) -> "np.ndarray":
         torch = self._torch
         batch = self._build_batch(obs, image_variant=image_variant)
+        pre, post, policy = engine["pre"], engine["post"], engine["policy"]
         with torch.no_grad():
-            processed = self.preprocessor(batch) if self.preprocessor else batch
-            chunk = self.policy.predict_action_chunk(processed)  # (1, H, D)
-            chunk = self._unnormalize(chunk)
+            processed = pre(batch) if pre else batch
+            chunk = policy.predict_action_chunk(processed)  # (1, H, D)
+            chunk = self._unnormalize(chunk, post)
         arr = np.asarray(chunk.detach().to("cpu", dtype=torch.float32).numpy())
         arr = arr.reshape(arr.shape[-2], arr.shape[-1])  # (H, D)
         return arr[:, :7]
 
-    def _unnormalize(self, chunk):
+    def _unnormalize(self, chunk, post):
         # postprocessor で実アクション空間へ戻す。アフィン変換なので、後段で
         # 平均を取ってから戻しても等価だが、ここで戻して以降を実座標に統一する。
-        if self.postprocessor is None:
+        if post is None:
             return chunk
-        torch = self._torch
         try:
-            out = self.postprocessor({"action": chunk})
+            out = post({"action": chunk})
             if isinstance(out, dict):
                 out = out.get("action", chunk)
             return out
         except Exception:  # noqa: BLE001 - 版差異時はそのまま実座標とみなす
             try:
-                return self.postprocessor(chunk)
+                return post(chunk)
             except Exception:  # noqa: BLE001
                 return chunk
 
     def _predict_chunk_ensemble(self, obs) -> tuple["np.ndarray", float]:
-        # TTA ビューを平均して (H,7) チャンクと不一致(スカラー)を返す。
+        # 全エンジン × TTA ビューでチャンクを予測し、実座標で平均して
+        # (H,7) チャンクと不一致(スカラー)を返す。エンジン間で H が異なる場合は
+        # 最短に合わせて切り詰める。
         np_ = self._np
         views = max(1, int(self.TTA_VIEWS))
         chunks = []
-        for v in range(views):
-            try:
-                chunks.append(self._predict_chunk_one(obs, image_variant=v))
-            except Exception as exc:  # noqa: BLE001 - 1 ビュー失敗は無視
-                if not chunks and v == views - 1:
-                    raise
-                print(f"[MyPolicy] TTA view {v} 失敗: {exc}")
-        stack = np_.stack(chunks, axis=0)              # (V, H, 7)
-        mean_chunk = stack.mean(axis=0)                # (H, 7)
+        for engine in self.engines:
+            for v in range(views):
+                try:
+                    chunks.append(self._predict_chunk_one(obs, v, engine))
+                except Exception as exc:  # noqa: BLE001 - 個々の失敗は無視
+                    print(f"[MyPolicy] chunk 予測失敗 (view {v}): {exc}")
+        if not chunks:
+            raise RuntimeError("全てのチャンク予測に失敗しました。")
+        horizon = min(c.shape[0] for c in chunks)
+        stack = np_.stack([c[:horizon] for c in chunks], axis=0)  # (N, H, 7)
+        mean_chunk = stack.mean(axis=0)                            # (H, 7)
         if stack.shape[0] > 1:
-            # 直近ステップ(先頭)の並進 xyz のビュー間ばらつきを不一致とする
+            # 直近ステップ(先頭)の並進 xyz の予測ばらつきを不一致とする
             disagreement = float(np_.mean(np_.std(stack[:, 0, :3], axis=0)))
         else:
             disagreement = 0.0
@@ -369,13 +485,16 @@ class MyPolicy(BasePolicy):
             action = self._apply_uncertainty(action, dis)
             return action
 
-        # フォールバック: full-chunk API が無い版は select_action を 1 手ずつ。
+        # フォールバック: full-chunk API が無い版は先頭エンジンの select_action を
+        # 1 手ずつ使う（時間方向アンサンブル・多モデル平均は無効）。
         torch = self._torch
+        engine = self.engines[0]
+        pre, post, policy = engine["pre"], engine["post"], engine["policy"]
         batch = self._build_batch(obs, image_variant=0)
         with torch.no_grad():
-            processed = self.preprocessor(batch) if self.preprocessor else batch
-            act = self.policy.select_action(processed)
-            act = self._unnormalize(act)
+            processed = pre(batch) if pre else batch
+            act = policy.select_action(processed)
+            act = self._unnormalize(act, post)
         act = np_.asarray(act.detach().to("cpu", dtype=torch.float32).numpy()).reshape(-1)
         if act.shape[0] < 7:
             act = np_.pad(act, (0, 7 - act.shape[0]))
