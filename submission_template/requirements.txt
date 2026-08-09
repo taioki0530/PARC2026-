@@ -4,7 +4,14 @@ uvicorn>=0.15
 msgpack>=1.0
 numpy>=1.19
 
-# 以下に自分のモデルに必要なライブラリを追加してください
-# 例:
-# torch>=2.0
-# transformers>=4.30
+# --- SmolVLA（LeRobot）ポリシーの依存 ---
+# 採点環境は外部通信を遮断するため、git+ / --index-url は使用不可。
+# いずれも PyPI から取得できるバージョンを指定する。
+# 学習に用いた LeRobot v0.6.0 に合わせて固定する。
+lerobot[smolvla]==0.6.0
+torch>=2.2
+transformers>=4.44
+accelerate>=0.30
+safetensors>=0.4
+num2words>=0.5
+huggingface_hub>=0.24
