@@ -2,7 +2,24 @@
 
 | ファイル | 内容 |
 |---|---|
-| [smolvla_libero_spatial_lora.ipynb](smolvla_libero_spatial_lora.ipynb) | SmolVLA を LIBERO-plus Spatial で LoRA 追加学習する Google Colab ノートブック |
+| [smolvla_libero_spatial_lora.ipynb](smolvla_libero_spatial_lora.ipynb) | SmolVLA を LIBERO-plus Spatial で LoRA 追加学習する Google Colab ノートブック（最小構成の入門） |
+| [smolvla_libero_track1_finetune.ipynb](smolvla_libero_track1_finetune.ipynb) | Track 1 の 1mm 衝突ルールに向けた広域 fine-tuning。libero_plus 全体から広くタスクを選び、アンサンブル用に複数モデルを量産する。評価は配布キット（`pipeline`/`tune.py`）の実ルール採点に委ねる |
+
+## smolvla_libero_track1_finetune.ipynb
+
+Track 1 の成功判定（ゴール達成 **かつ** 対象外物体の変位が全ステップで 1mm 以下）に
+向けた fine-tuning ノートブック。Spatial 限定の入門ノートを土台に、次の3点で強化する。
+
+1. **広域データ学習** — libero_plus（テクスチャ/照明などの摂動を含む）から
+   object/goal も含めて広くタスクを選び、分布シフト由来の衝突を減らす
+2. **アンサンブル量産** — `MODEL_TAG` / `TASK_NAME_FILTERS` / `SEED` を変えて複数回実行し、
+   専門家モデルを `submission_template/model_weights/<名前>/` に並べる（MyPolicy が自動で合議）
+3. **実ルール評価への委譲** — `lerobot-eval` は衝突判定をしないため本ノートでは評価せず、
+   学習後にキットの `python -m pipeline` / `python tune.py` で 1mm 判定つき成功率を実測する
+
+> 技術メモ: SmolVLA は flow-matching 損失のため「衝突ペナルティ項」を損失へ直接
+> 差し込むことはできない。1mm ルールへの対応は、広域データ学習・実ルールでの
+> チェックポイント選抜・推論時の衝突配慮制御（`policy_server.py` に実装済み）で行う。
 
 ## smolvla_libero_spatial_lora.ipynb
 
